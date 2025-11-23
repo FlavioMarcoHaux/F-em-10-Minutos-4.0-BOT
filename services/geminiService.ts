@@ -1,448 +1,282 @@
 
-import { GoogleGenAI, Type, Modality } from "@google/genai";
-import { AspectRatio, SocialMediaPost, YouTubeLongPost } from "../types";
-import { createWavHeader } from "../utils/audio";
-import { createOPFSFile } from "../utils/opfsUtils";
+import { GoogleGenAI, GenerateContentResponse, Part } from "@google/genai";
+import { createOPFSFile, writeChunkToStream, getOPFSFileAsBlob } from '../utils/opfsUtils';
+import { YouTubeLongPost, SocialMediaPost, AspectRatio } from '../types';
 
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+// Helper to clean stage directions from the start of lines for TTS
+const cleanTextForSpeech = (text: string): string => {
+    // Removes (Softly), [Pause], etc., only if they appear at the start of a line or sentence
+    // Preserves internal emphasis like *stars* or (biblical references) inside the sentence.
+    return text.replace(/^\s*[\(\[][^)\]]*[\)\]]\s*/gm, "");
+};
 
 export interface MultiSpeakerConfig {
     speakers: { name: string; voice: string }[];
 }
 
-export interface SpeechCallbacks {
-    onChunk: (data: Uint8Array) => void;
-    onProgress: (val: number) => void;
-    onComplete: () => void;
-    onError: (msg: string) => void;
-}
+// --- CORE GENERATION FUNCTIONS ---
 
-// Helper to sleep between requests to avoid 429
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+export const generateGuidedPrayer = async (prompt: string, language: string, duration: number = 10): Promise<string> => {
+    const model = 'gemini-2.5-flash'; // Using Flash for high-volume text generation (recursion)
+    
+    // Language Map
+    const langMap: {[key: string]: string} = { 'pt': 'Português', 'en': 'Inglês', 'es': 'Espanhol' };
+    const targetLang = langMap[language] || 'Inglês';
 
-interface DialogueBlock {
-    speaker: string;
-    text: string;
-}
+    // Calculate iterations based on duration to ensure density
+    // 10 min = 2 calls (approx 2500 words) -> High Density
+    // 60 min = 8 calls (approx 10000 words)
+    const numIterations = Math.ceil(duration / 7); 
+    let fullPrayer = "";
+    let lastContext = "";
 
-/**
- * Parses a script into sequential blocks based on speaker changes.
- * Also handles splitting very long monologues into smaller chunks to fit TTS input limits.
- */
-const parseDialogueIntoChunks = (text: string): DialogueBlock[] => {
-    const lines = text.split('\n');
-    const blocks: DialogueBlock[] = [];
-    let currentSpeaker = "Narrator"; // Default
-    let currentBuffer = "";
+    console.log(`Starting Recursive Generation: ${duration} min = ${numIterations} iterations.`);
 
-    // Regex to detect "Name: Text" pattern
-    const speakerRegex = /^(\*{0,2})([A-Za-z\s]+)(\*{0,2}):\s*(.*)$/;
+    for (let i = 0; i < numIterations; i++) {
+        const isFirst = i === 0;
+        const isLast = i === numIterations - 1;
+        
+        const systemInstruction = `
+        You are a Master of Guided Prayer and Erickson Hypnosis.
+        Your goal is to write a DEEPLY THERAPEUTIC dialogue script.
+        
+        CRITICAL RULES:
+        1. CHARACTERS: The dialogue MUST be exclusively between "Roberta Erickson" (Voice: Aoede, Soft, NLP Guide) and "Milton Dilts" (Voice: Enceladus, Deep, Hypnotic Voice).
+        2. FORMAT: Always start lines with "Roberta Erickson:" or "Milton Dilts:". Do NOT use other names.
+        3. LANGUAGE: Write strictly in ${targetLang}.
+        4. NO META-DATA: Do NOT write introductions like "Here is the script", summaries, or stage directions in parentheses at the start of lines. Just the dialogue.
+        5. DENSITY: Write extensive, rich, poetic text. Use sensory descriptions (VAK), loops, and embedded commands.
+        6. GOLDEN THREAD: The central theme "${prompt || 'Divine Connection'}" must be woven into every paragraph to maintain focus.
+        
+        STRUCTURAL GOAL FOR THIS BLOCK (Part ${i + 1} of ${numIterations}):
+        ${isFirst ? "- Start with a 'Hypnotic Hook': A provocative question or deep validation of the user's pain to grab attention immediately (First 30s). Then move to induction." : ""}
+        ${!isFirst && !isLast ? "- Deepening: Biblical metaphors (David/Solomon/Jesus), PNL ressignification, sensory immersion. Expand on the theme." : ""}
+        ${isLast ? "- Anchor the feeling, gratitude, and slowly return. End with a blessing." : ""}
+        
+        ${!isFirst ? `CONTEXT FROM PREVIOUS BLOCK: "...${lastContext.slice(-300)}"` : ""}
+        `;
 
-    const pushBuffer = () => {
-        if (currentBuffer.trim()) {
-            // Split extremely long buffers to avoid timeouts
-            const MAX_CHAR_LIMIT = 1500; // Safe limit for TTS model per request
-            if (currentBuffer.length > MAX_CHAR_LIMIT) {
-                const sentences = currentBuffer.match(/[^.!?]+[.!?]+["']?|[^.!?]+$/g) || [currentBuffer];
-                let tempChunk = "";
-                
-                for (const sentence of sentences) {
-                    if ((tempChunk + sentence).length > MAX_CHAR_LIMIT) {
-                        blocks.push({ speaker: currentSpeaker, text: tempChunk.trim() });
-                        tempChunk = sentence;
-                    } else {
-                        tempChunk += sentence;
-                    }
-                }
-                if (tempChunk.trim()) {
-                    blocks.push({ speaker: currentSpeaker, text: tempChunk.trim() });
-                }
-            } else {
-                blocks.push({ speaker: currentSpeaker, text: currentBuffer.trim() });
-            }
-            currentBuffer = "";
+        const userPrompt = `
+        Write Part ${i + 1}/${numIterations} of the prayer about "${prompt}".
+        Duration target for this block: ~8 minutes of spoken text (approx 1200 words).
+        Keep the flow continuous. Start directly with a character name.
+        `;
+
+        try {
+            const result = await ai.models.generateContent({
+                model,
+                contents: userPrompt,
+                config: { systemInstruction, temperature: 0.7 } // Creative but coherent
+            });
+            
+            const text = result.text || "";
+            fullPrayer += text + "\n\n";
+            lastContext = text;
+        } catch (e) {
+            console.error(`Error in block ${i}:`, e);
+            // If one block fails, we return what we have so far rather than crashing
+            break; 
         }
-    };
+    }
+
+    return fullPrayer;
+};
+
+export const generateShortPrayer = async (prompt: string, language: string): Promise<string> => {
+    // Short prayer (pills) doesn't need recursion
+    return generateGuidedPrayer(prompt, language, 5); 
+};
+
+// --- SPEECH GENERATION (BLADE RUNNER ARCHITECTURE) ---
+
+const parseDialogueIntoChunks = (text: string): { speaker: string; text: string }[] => {
+    const lines = text.split('\n');
+    const chunks: { speaker: string; text: string }[] = [];
+    let currentSpeaker = 'Narrator'; // Default
+    let currentBuffer = '';
+
+    // Regex to detect "Name:" pattern
+    const speakerRegex = /^([A-Za-zÀ-ÖØ-öø-ÿ ]+):/i;
 
     for (const line of lines) {
         const match = line.match(speakerRegex);
         if (match) {
-            // New speaker found
-            pushBuffer(); // Save previous block
-            
-            // Clean up speaker name (remove asterisks)
-            let rawName = match[2].trim();
-            if (rawName.toLowerCase().includes("roberta")) currentSpeaker = "Roberta Erickson";
-            else if (rawName.toLowerCase().includes("milton")) currentSpeaker = "Milton Dilts";
-            else currentSpeaker = rawName;
-
-            currentBuffer = match[4] + " "; // Start new buffer with the text part
+            // If we have a buffer for the previous speaker, push it
+            if (currentBuffer.trim()) {
+                chunks.push({ speaker: currentSpeaker, text: currentBuffer.trim() });
+            }
+            // Start new speaker
+            currentSpeaker = match[1].trim();
+            currentBuffer = line.replace(speakerRegex, '').trim();
         } else {
-            // Continuation of current speaker
+            // Append to current speaker
             if (line.trim()) {
-                currentBuffer += line.trim() + "\n";
+                currentBuffer += ' ' + line.trim();
             }
         }
     }
-    pushBuffer(); // Push last block
-
-    // Fallback: If no speaker structure found, treat entire text as one (or split if huge)
-    if (blocks.length === 0 && text.trim().length > 0) {
-        currentSpeaker = "Narrator";
-        currentBuffer = text;
-        pushBuffer();
+    // Push final buffer
+    if (currentBuffer.trim()) {
+        chunks.push({ speaker: currentSpeaker, text: currentBuffer.trim() });
     }
 
-    return blocks;
-};
+    // Further split very long chunks to avoid TTS timeouts
+    const finalChunks: { speaker: string; text: string }[] = [];
+    const MAX_CHARS = 1500; 
 
-export const generateGuidedPrayer = async (prompt: string, language: string, duration: number = 10): Promise<string> => {
-    // Use gemini-2.5-flash for speed and context window, but orchestrated for long content
-    const model = 'gemini-2.5-flash'; 
-    
-    // BATCH CHAINING STRATEGY:
-    // 10 min = ~1500 words. 60 min = ~9000 words.
-    // We will generate in chunks of ~10 minutes to ensure density and avoid cutoffs.
-    const chunkSizeMinutes = 7; // Safe margin
-    const numBatches = Math.ceil(duration / chunkSizeMinutes);
-    
-    let fullScript = "";
-    let previousContext = "";
-
-    console.log(`Generating prayer for ${duration} min in ${numBatches} batches.`);
-
-    for (let i = 1; i <= numBatches; i++) {
-        // Define structural focus based on current batch position
-        let focus = "";
-        if (i === 1) {
-            focus = "Introduction (Hypnotic Hook & Validation), Rapport Building, and Initial Induction (Pacing and Leading). Establish the sacred space.";
-        } else if (i === numBatches) {
-            focus = "Final Integration, Post-Hypnotic Suggestions for future well-being, gratitude, and a Gentle Awakening/Closing Blessing.";
+    for (const chunk of chunks) {
+        if (chunk.text.length > MAX_CHARS) {
+            // Split by sentences roughly
+            const sentences = chunk.text.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [chunk.text];
+            let temp = '';
+            for (const sentence of sentences) {
+                if ((temp + sentence).length > MAX_CHARS) {
+                    finalChunks.push({ speaker: chunk.speaker, text: temp });
+                    temp = sentence;
+                } else {
+                    temp += temp ? ' ' + sentence : sentence;
+                }
+            }
+            if (temp) finalChunks.push({ speaker: chunk.speaker, text: temp });
         } else {
-            // Middle batches - iterate through subthemes or deepen the main theme
-            focus = `Deepening the Trance. Exploring the theme '${prompt}' through metaphors, NLP reframing, and spiritual storytelling. Reinforce the 'Golden Thread' of ${prompt}. Increase emotional intensity. Use embedded commands.`;
-        }
-
-        const systemInstruction = `You are a master spiritual scriptwriter, expert in NLP and Ericksonian Hypnosis.
-        Language: ${language}.
-        
-        TASK: Write PARTE ${i} of ${numBatches} for a ${duration}-minute guided prayer/meditation script.
-        THEME: ${prompt}.
-        GOLDEN THREAD (Anchor): The core theme "${prompt}" must be woven into every segment to maintain focus.
-        
-        CHARACTERS (STRICT REQUIREMENT):
-        The script must be a therapeutic dialogue EXCLUSIVELY between two guides. 
-        You MUST use these exact names for the audio engine to work:
-        1. **Roberta Erickson** (Voice of Comfort, NLP Guide) -> Maps to 'Aoede' voice.
-        2. **Milton Dilts** (Voice of Authority, Hypnotherapist) -> Maps to 'Enceladus' voice.
-        
-        FORMAT RULES:
-        - Output ONLY the dialogue lines.
-        - Format: "Speaker Name: Text..."
-        - Do NOT use parenthetical stage directions like (softly), (pause), or (music) at the start of lines. Embed the pacing into the punctuation (ellipses...) and italics *emphasis*.
-        - Keep the flow continuous.
-        - DENSITY: This is for a ${duration} minute audio. Write EXTENSIVELY. Each batch must be long and detailed (approx 1000 words).
-        
-        CURRENT BATCH FOCUS: ${focus}
-        
-        ${previousContext ? `CONTEXT FROM PREVIOUS PART: "...${previousContext}"\nContinue smoothly from here, maintaining the narrative arc.` : "Start the session now with a strong hypnotic hook."}
-        `;
-
-        const batchPrompt = `Write the next segment of the script (approx 1000 words). Ensure rich sensory details (Visual, Auditory, Kinesthetic) and maintain the "Golden Thread" of ${prompt}.`;
-
-        try {
-            console.log(`Requesting batch ${i}/${numBatches}...`);
-            const response = await ai.models.generateContent({
-                model,
-                contents: batchPrompt,
-                config: { systemInstruction }
-            });
-            
-            const text = response.text || "";
-            fullScript += text + "\n\n";
-            
-            // Keep the last few sentences as context for the next batch to ensure coherence
-            const sentences = text.split('.');
-            previousContext = sentences.slice(-3).join('.');
-            if (previousContext.length > 500) previousContext = previousContext.substring(previousContext.length - 500);
-            
-            // Rate limit safety
-            if (i < numBatches) await delay(1000);
-            
-        } catch (error) {
-            console.error(`Error generating batch ${i}:`, error);
-            if (i === 1) throw error; // If first batch fails, fail all
-            break; // Otherwise return what we have
+            finalChunks.push(chunk);
         }
     }
 
-    return fullScript;
-};
-
-export const generateShortPrayer = async (prompt: string, language: string): Promise<string> => {
-    const model = 'gemini-2.5-flash';
-    const systemInstruction = `You are a spiritual companion. Language: ${language}.`;
-    const userPrompt = prompt 
-        ? `Write a short, powerful prayer (3-5 sentences) about: ${prompt}.`
-        : `Write a short, powerful prayer (3-5 sentences) on a random uplifting theme.`;
-        
-    try {
-        const response = await ai.models.generateContent({
-            model,
-            contents: userPrompt,
-            config: { systemInstruction }
-        });
-        return response.text || "";
-    } catch (error) {
-        console.error("Error generating short prayer:", error);
-        throw error;
-    }
+    return finalChunks;
 };
 
 export const generateSpeech = async (
     text: string, 
-    multiSpeakerConfig: MultiSpeakerConfig | undefined, 
-    callbacks: SpeechCallbacks, 
-    fileHandle?: FileSystemFileHandle
-) => {
-    try {
-        const model = "gemini-2.5-flash-preview-tts";
-        
-        // 1. PARSE DIALOGUE INTO SEQUENTIAL BLOCKS
-        const blocks = parseDialogueIntoChunks(text);
-        console.log(`Audio Generation: Split text into ${blocks.length} blocks for sequential processing.`);
+    multiSpeakerConfig?: MultiSpeakerConfig,
+    callbacks?: {
+        onChunk?: (data: Uint8Array) => void,
+        onProgress?: (progress: number) => void,
+        onComplete?: () => void,
+        onError?: (msg: string) => void
+    },
+    opfsFileHandle?: FileSystemFileHandle
+): Promise<void> => {
+    const model = 'gemini-2.5-flash-preview-tts'; // Correct TTS model
+    const blocks = parseDialogueIntoChunks(text);
+    const totalBlocks = blocks.length;
+    let processedBlocks = 0;
 
-        let writable: FileSystemWritableFileStream | undefined;
-        let totalSize = 0;
-        
-        // Prepare OPFS Writer
-        if (fileHandle) {
-             writable = await fileHandle.createWritable();
-             // Placeholder header (44 bytes)
-             const header = createWavHeader(0, 1, 24000, 16);
-             await writable.write(header);
-        }
+    // Open writable stream if OPFS is used
+    let writable: FileSystemWritableFileStream | null = null;
+    if (opfsFileHandle) {
+        writable = await opfsFileHandle.createWritable({ keepExistingData: false });
+    }
 
-        // 2. SEQUENTIAL GENERATION LOOP (The "Assembly Line")
-        for (let i = 0; i < blocks.length; i++) {
-            const block = blocks[i];
-            console.log(`Processing Audio Block ${i + 1}/${blocks.length}: ${block.speaker} (${block.text.length} chars)`);
-
-            // Surgical Regex: Removes stage directions ONLY if they appear at the start of the line.
-            // Matches: "(Softly) Text" -> "Text" or "[Pause] Text" -> "Text"
-            let cleanedText = block.text.replace(/^\s*(?:[\(\[].*?[\)\]])\s*/, "");
-            
-            // Ensure text is not empty after cleaning
-            if (!cleanedText.trim()) continue;
-
-            // Dynamic Voice Selection based on Speaker Name
-            let voiceName = 'Kore'; // Default fallback
-            const speakerName = block.speaker.toLowerCase();
-            
-            if (speakerName.includes("roberta")) voiceName = 'Aoede'; // Female, Soft
-            else if (speakerName.includes("milton")) voiceName = 'Enceladus'; // Male, Deep
-            // Fallback to config if provided
-            else if (multiSpeakerConfig) {
-                const found = multiSpeakerConfig.speakers.find(s => s.name === block.speaker);
-                if (found) voiceName = found.voice;
+    for (const block of blocks) {
+        try {
+            // Determine voice
+            let voiceName = 'Aoede'; // Default female
+            if (multiSpeakerConfig) {
+                const speakerMap = multiSpeakerConfig.speakers.find(s => 
+                    block.speaker.toLowerCase().includes(s.name.toLowerCase().split(' ')[0]) // Match first name
+                );
+                if (speakerMap) voiceName = speakerMap.voice;
             }
 
-            const config: any = {
-                responseModalities: [Modality.AUDIO],
-                speechConfig: {
-                    voiceConfig: {
-                      prebuiltVoiceConfig: { voiceName: voiceName },
-                    },
-                },
-            };
+            // Surgical Clean: Remove stage directions from start of speech only
+            const textToSpeak = cleanTextForSpeech(block.text);
+            if (!textToSpeak.trim()) continue;
 
-            // Generate Stream for this specific block
-            const responseStream = await ai.models.generateContentStream({
+            const response = await ai.models.generateContent({
                 model,
-                contents: cleanedText,
-                config
+                contents: { parts: [{ text: textToSpeak }] },
+                config: {
+                    responseModalities: ['AUDIO'],
+                    speechConfig: {
+                        voiceConfig: { prebuiltVoiceConfig: { voiceName } }
+                    }
+                }
             });
 
-            for await (const chunk of responseStream) {
-                const base64Audio = chunk.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-                if (base64Audio) {
-                    const binaryString = atob(base64Audio);
-                    const len = binaryString.length;
-                    const bytes = new Uint8Array(len);
-                    for (let j = 0; j < len; j++) {
-                        bytes[j] = binaryString.charCodeAt(j);
-                    }
+            const audioData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+            
+            if (audioData) {
+                // Decode Base64 to Uint8Array
+                const binaryString = atob(audioData);
+                const bytes = new Uint8Array(binaryString.length);
+                for (let i = 0; i < binaryString.length; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
 
-                    // Direct Disk Write (Zero RAM Overhead)
-                    if (writable) {
-                        await writable.write(bytes);
-                    } else {
-                        // Fallback for non-fileHandle mode (short audios only)
-                        callbacks.onChunk(bytes); 
-                    }
-                    
-                    totalSize += bytes.length;
+                if (writable) {
+                    await writeChunkToStream(writable, bytes);
+                } else if (callbacks?.onChunk) {
+                    callbacks.onChunk(bytes);
                 }
             }
 
-            // Update Progress
-            callbacks.onProgress(Math.round(((i + 1) / blocks.length) * 100));
-
-            // Safety Delay to prevent Rate Limits (429)
-            await delay(500); 
-        }
-
-        // 3. FINALIZE FILE
-        if (writable) {
-            // Update WAV header with correct total size
-            try {
-                const header = createWavHeader(totalSize, 1, 24000, 16);
-                await writable.seek(0);
-                await writable.write(header);
-            } catch (e) {
-                console.warn("Could not update WAV header in OPFS", e);
+            processedBlocks++;
+            if (callbacks?.onProgress) {
+                callbacks.onProgress(Math.round((processedBlocks / totalBlocks) * 100));
             }
-            await writable.close();
+
+            // Small delay to be gentle on rate limits
+            await new Promise(r => setTimeout(r, 100));
+
+        } catch (e: any) {
+            console.error("TTS Generation Error on block:", block, e);
+            if (callbacks?.onError) callbacks.onError(`Error generating audio for block ${processedBlocks + 1}`);
+            // Continue to next block to salvage what we can
         }
-
-        callbacks.onComplete();
-
-    } catch (error: any) {
-        callbacks.onError(error.message || "Audio generation failed");
-    }
-};
-
-export const createMediaPromptFromPrayer = async (prayer: string, language: string): Promise<string> => {
-    const model = 'gemini-2.5-flash';
-    const response = await ai.models.generateContent({
-        model,
-        contents: `Based on this prayer, describe a peaceful, spiritual, and artistic image suitable for a background. 
-        Prayer: "${prayer.substring(0, 500)}..."
-        Output ONLY the English image prompt description. Keep it under 50 words.`,
-    });
-    return response.text || "Peaceful spiritual landscape";
-};
-
-export const generateImageFromPrayer = async (prompt: string, aspectRatio: AspectRatio, modelName: string = 'gemini-2.5-flash-image'): Promise<string> => {
-    
-    const config: any = {
-        aspectRatio: aspectRatio,
-    };
-    
-    if (modelName.includes('imagen')) {
-         config.outputMimeType = 'image/jpeg';
-         const response = await ai.models.generateImages({
-            model: modelName,
-            prompt,
-            config: {
-                ...config,
-                numberOfImages: 1,
-            }
-         });
-         return response.generatedImages[0].image.imageBytes;
-    } else {
-        // Nano banana (gemini-2.5-flash-image)
-        const response = await ai.models.generateContent({
-            model: modelName,
-            contents: { parts: [{ text: prompt }] },
-            config: {
-                imageConfig: {
-                    aspectRatio: aspectRatio as any
-                }
-            }
-        });
-        
-        for (const part of response.candidates?.[0]?.content?.parts || []) {
-            if (part.inlineData) {
-                return part.inlineData.data;
-            }
-        }
-        throw new Error("No image data found in response");
-    }
-};
-
-export const generateVideo = async (prompt: string, aspectRatio: AspectRatio): Promise<string> => {
-    let operation = await ai.models.generateVideos({
-        model: 'veo-3.1-fast-generate-preview',
-        prompt,
-        config: {
-            numberOfVideos: 1,
-            resolution: '720p',
-            aspectRatio: aspectRatio as any
-        }
-    });
-
-    while (!operation.done) {
-        await new Promise(resolve => setTimeout(resolve, 5000));
-        operation = await ai.operations.getVideosOperation({ operation: operation });
     }
 
-    const uri = operation.response?.generatedVideos?.[0]?.video?.uri;
-    if (!uri) throw new Error("Video generation failed to return URI");
-    return uri;
+    if (writable) {
+        await writable.close();
+    }
+
+    if (callbacks?.onComplete) callbacks.onComplete();
 };
 
-export const analyzeImage = async (file: File, prompt: string, language: string): Promise<string> => {
-    const base64Data = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onloadend = () => {
-            const res = reader.result as string;
-            resolve(res.split(',')[1]);
-        };
-        reader.onerror = reject;
-        reader.readAsDataURL(file);
-    });
-
-    const model = 'gemini-2.5-flash';
-    const response = await ai.models.generateContent({
-        model,
-        contents: {
-            parts: [
-                { inlineData: { mimeType: file.type, data: base64Data } },
-                { text: prompt || `Analyze this image spiritually and symbolically in ${language}.` }
-            ]
-        }
-    });
-    return response.text || "";
-};
+// --- VISUAL GENERATION ---
 
 export const createThumbnailPromptFromPost = async (title: string, description: string, prayer: string, language: string): Promise<string> => {
     const model = 'gemini-2.5-flash';
-    
-    // Determine target language name for prompt instructions
     const langMap: {[key: string]: string} = { 'pt': 'Português', 'en': 'Inglês', 'es': 'Espanhol' };
     const targetLangName = langMap[language] || 'Inglês';
 
-    // SYSTEM INSTRUCTION: VISUAL STRATEGIST FOR CLICKBAIT/HIGH-CTR
     const systemInstruction = `
-    You are a world-class YouTube Strategist and Semiotics Expert specialized in High-CTR (Click-Through Rate) Thumbnails.
+    You are a world-class YouTube Strategist and Semiotics Expert, specialized in 'SEXY CANVAS' psychology to create High-CTR Thumbnails.
     
-    YOUR GOAL: Generate a single, highly detailed image generation prompt for 'Imagen 4 Ultra' that will result in a VIRAL, CLICKBAIT-STYLE thumbnail.
+    YOUR GOAL: Generate a prompt for 'Imagen 4 Ultra' to create a VIRAL, CLICKBAIT-STYLE thumbnail based **STRICTLY** on the Marketing TITLE.
     
     CRITICAL RULES:
-    1. LANGUAGE MATCHING: If the video content is in ${targetLangName}, any text inside the image MUST be in ${targetLangName}. This is non-negotiable.
-    2. OUTPUT FORMAT: Return ONLY the raw prompt string in English. Do not add introductions or quotes.
+    1. SOURCE OF TRUTH: Analyze **ONLY the TITLE** to determine the hook. Do NOT look at the description or prayer text for the text overlay content.
+    2. LANGUAGE MATCHING: Text inside the image MUST be in ${targetLangName}.
+    3. OUTPUT FORMAT: Return ONLY the raw prompt string in English.
+    4. TEXT STRUCTURE: The text overlay MUST consist of TWO SHORT PHRASES (Headline + Subheadline). The Subheadline MUST have at least 3 words. Use synonyms from the title to avoid exact repetition.
     
-    VISUAL FORMULA FOR VIRALITY:
-    - **Subject**: Expressive, emotional (e.g., a person in deep prayer with tears of joy, or a divine silhouette against a powerful light).
-    - **Text Overlay**: MAXIMUM 3-5 words. Massive, bold, 3D typography. High contrast colors (Yellow/White text on Dark/Blue background).
-    - **Effects**: Parallax depth, Glow, God Rays, Particles, High Contrast.
-    - **Psychology**: Create a "Curiosity Gap" or a sense of "Immediate Transformation".
+    SEXY CANVAS METHODOLOGY (Analyze the TITLE to choose the trigger):
+    - **Sloth (Laziness)**: If title promises fast results ("1 Minute"). Text Ex: "DURMA AGORA / PAZ INSTANTÂNEA AQUI".
+    - **Greed (Gain)**: If title promises blessings/money. Text Ex: "RECEBA TUDO / MILAGRE FINANCEIRO HOJE".
+    - **Wrath (Justice)**: If title mentions enemies. Text Ex: "ELES CAIRÃO / FOGO CONTRA O MAL".
+    - **Pride (Chosen)**: If title says "God chose you". Text Ex: "VOCÊ FOI / ESCOLHIDO POR DEUS".
+    - **Lust (Intimacy)**: If title talks about Love. Text Ex: "AMOR REAL / ELE TE OUVE AGORA".
     
-    The prompt must describe the scene and explicitly instruct the AI to render the text.
+    VISUAL FORMULA:
+    - **Subject**: Highly expressive human face (close up) showing emotion relevant to the hook OR Divine/Mystical silhouette with glowing aura.
+    - **Text Overlay**: Massive 3D font, High Contrast (Yellow/White on Dark).
+    - **Style**: Hyper-realistic, 8k, cinematic lighting, YouTube Clickbait style (MrBeast style high contrast).
     `;
 
     const userPrompt = `
-    CONTEXT:
-    Video Title: "${title}"
-    Description: "${description.substring(0, 200)}..."
+    MARKETING TITLE: "${title}"
+    (Analyze ONLY this Title for the visual hook and text).
+    
+    CONTEXT (Mood only - DO NOT use for text):
+    Prayer Theme: "${prayer.substring(0, 100)}..."
     
     TASK:
-    Create the prompt.
-    Extract a short, punchy hook from the title (e.g. "GOD SAYS THIS" or "POWERFUL PRAYER") in ${targetLangName} for the text overlay.
-    
-    Example Structure of your output:
-    "A hyper-realistic 8k close-up of [Subject] with [Emotion]. Background is [Atmosphere]. In the foreground, huge 3D glowing text reads: '[HOOK IN ${targetLangName}]'. Cinematic lighting, high contrast, rule of thirds."
+    1. Extract the 'Sexy Canvas' trigger from the TITLE.
+    2. Define the text overlay: TWO PHRASES in ${targetLangName}. Subtitle must be 3+ words. Use synonyms.
+    3. Generate the full image prompt describing the visual and the specific text to render.
     `;
 
     const response = await ai.models.generateContent({
@@ -453,175 +287,193 @@ export const createThumbnailPromptFromPost = async (title: string, description: 
     return response.text || "Spiritual cinematic background with text overlay";
 };
 
-export const generateSocialMediaPost = async (prayer: string, language: string): Promise<SocialMediaPost> => {
-     const model = 'gemini-2.5-flash';
-     const prompt = `
-        You are a social media expert. Create a viral short video post (TikTok/Reels) for this prayer:
-        "${prayer.substring(0, 500)}..."
-        Language: ${language}.
-        
-        Return JSON with:
-        - title (catchy hook)
-        - description (engaging caption)
-        - hashtags (array of strings)
-     `;
-     
-     const response = await ai.models.generateContent({
-         model,
-         contents: prompt,
-         config: {
-             responseMimeType: "application/json",
-             responseSchema: {
-                 type: Type.OBJECT,
-                 properties: {
-                     title: { type: Type.STRING },
-                     description: { type: Type.STRING },
-                     hashtags: { type: Type.ARRAY, items: { type: Type.STRING } }
-                 },
-                 required: ["title", "description", "hashtags"]
-             }
-         }
-     });
-     
-     return JSON.parse(response.text || "{}");
-};
-
-export const generateYouTubeLongPost = async (theme: string, subthemes: string[], language: string, durationInMinutes: number = 10): Promise<YouTubeLongPost> => {
-    const model = 'gemini-2.5-flash';
-    // Scale chapters based on duration (approx 1 chapter every 3-5 mins)
-    const numChapters = Math.max(5, Math.ceil(durationInMinutes / 4)); 
-    const chaptersStr = `${numChapters}`;
-
-    const prompts: { [key: string]: string } = {
-        pt: `
-            Você é o especialista em SEO e mídias sociais do canal 'Fé em 10 minutos de Oração' (YouTube: https://www.youtube.com/@fe10minutos).
-            Sua tarefa é gerar Título, Descrição, Capítulos e Tags otimizados para um vídeo longo de oração (${durationInMinutes} min) sobre "${theme}".
-            Subtemas: ${subthemes.join(', ')}.
-            
-            REGRAS (TÍTULO):
-            - Deve ser chamativo, usar emoção/urgência e conter "${theme}".
-            - Modelo: "ORAÇÃO PODEROSA DE ${durationInMinutes} MINUTOS para [TEMA]" ou "A ORAÇÃO MAIS PODEROSA para [TEMA]".
-            - Deve terminar com: "| Fé em 10 minutos".
-
-            REGRAS (DESCRIÇÃO):
-            1. Comece repetindo exatamente o Título.
-            2. Escreva uma descrição rica (300-500 palavras) usando técnicas de PNL e Copywriting para prender a atenção, focada em "oração poderosa", "conversa com Deus" e "${theme}".
-            3. OBRIGATÓRIO - Inclua EXATAMENTE estes links no final da descrição (não altere nada nos links):
-
-            🌌 PARTICIPE DESTA JORNADA:
-            ► SÉRIE: Portais da Consciência (Playlist): https://www.youtube.com/watch?v=Q6x_C3uaKsQ&list=PLmeEfeSNeLbIyeBMB8HLrHwybI__suhgq
-            ► SÉRIE: ARQUITETURA DA ALMA (Playlist): https://www.youtube.com/playlist?list=PLmeEfeSNeLbIIm3MzGHSRFYfIONlBDofI
-            ► Oração da Manhã (Playlist): https://www.youtube.com/playlist?list=PLmeEfeSNeLbKppEyZUaBoXw4BVxZTq-I2
-            ► Oração da Noite (Playlist): https://www.youtube.com/playlist?list=PLmeEfeSNeLbLFUayT8Sfb9IQzr0ddkrHC
-            🔗 INSCREVA-SE NO CANAL: https://www.youtube.com/@fe10minutos
-
-            REGRAS (CAPÍTULOS):
-            - Gere uma lista de ${chaptersStr} títulos inspiradores baseados nos subtemas.
-            - **APENAS OS TÍTULOS. NÃO COLOQUE MINUTAGEM (ex: 00:00).**
-
-            REGRAS (TAGS/HASHTAGS):
-            - 3 Hashtags principais na descrição: #Oração #Fé #[TEMA_Sem_Espaço]
-            - Tags (campo tags): Lista com pelo menos 20 tags, incluindo: Fé em 10 minutos, Oração de 10 minutos, Oração Poderosa, ${theme}, Oração do Dia, Oração Guiada, Falar com Deus, Oração da Manhã, Oração da Noite, Palavra de Deus, Espiritualidade, Bênção, Milagre, Cura, Libertação.
-            
-            Retorne APENAS um JSON com: title, description, hashtags (array), timestamps (string multilinhas - SÓ TÍTULOS), tags (array).
-        `,
-        en: `
-            You are the SEO and social media expert for the 'Faith in 10 Minutes' channel (YouTube: https://www.youtube.com/@Faithin10Minutes).
-            Your task is to generate an optimized Title, Description, Timestamps, and Tags for a new long-form video (${durationInMinutes} minutes) on "${theme}".
-            Subtopics: ${subthemes.join(', ')}.
-
-            RULES (TITLE):
-            - Must be catchy, use emotion/urgency, and contain "${theme}".
-            - Follow model: "POWERFUL ${durationInMinutes}-MINUTE PRAYER for [TOPIC]" or "THE MOST POWERFUL PRAYER for [TOPIC]".
-            - Must end with: "| Faith in 10 Minutes".
-
-            RULES (DESCRIPTION):
-            1. Start by repeating the exact Title.
-            2. Write a rich description (300-500 words) using keywords: "powerful prayer", "guided prayer", "relationship with God", "message of faith", and "${theme}".
-            3. Include CTA links EXACTLY as follows at the end:
-
-            🕊️ WATCH NEXT:
-            ► Architecture of the Soul (Playlist) https://www.youtube.com/playlist?list=PLTQIQ5QpCYPo11ap1JUSiItZtoiV_4lEH
-            ► Morning Prayers (Playlist): https://www.youtube.com/playlist?list=PLTQIQ5QpCYPqym_6TF19PB71SpLpAGuZr
-            ► Evening Prayers (Playlist): https://www.youtube.com/playlist?list=PLTQIQ5QpCYPq91fvXaDSideb8wrnG-YtR
-            🔗 SUBSCRIBE TO THE CHANNEL: https://www.youtube.com/@Faithin10Minutes
-
-            RULES (TIMESTAMPS):
-            - Generate a list of ${chaptersStr} inspiring chapter titles based on subtopics.
-            - **TITLES ONLY. DO NOT INCLUDE TIMESTAMPS (e.g., 00:00).**
-
-            RULES (TAGS/HASHTAGS):
-            - 3 hashtags in description: #Prayer #Faith #[TOPIC_No_Space]
-            - Tags field: List at least 20 tags, including: Faith in 10 Minutes, 10 Minute Prayer, Powerful Prayer, ${theme}, Daily Prayer, Guided Prayer, Relationship with God, Morning Prayer, Evening Prayer, Prayer for Sleep, Prayer for Anxiety, Prayer for Healing, Word of God, Spirituality, Blessing, Miracle.
-            
-            Return ONLY JSON with: title, description, hashtags (array), timestamps (multiline string - TITLES ONLY), tags (array).
-        `,
-        es: `
-            Genera metadatos de YouTube OPTIMIZADOS PARA SEO y de ALTA CONVERSIÓN para un video de oración de ${durationInMinutes} min sobre "${theme}".
-            Subtemas: ${subthemes.join(', ')}.
-            
-            **REGLAS OBLIGATORIAS:**
-            1. Título Viral y Emocional: Usa gatillos mentales. Ej: "LA ORACIÓN MÁS PODEROSA DE [TEMA] PARA CAMBIAR TU VIDA | Fe en 10 Minutos".
-            2. Descripción Rica (Copywriting): Escribe una descripción de 300-500 palabras. Usa técnicas de PNL e Hipnosis en el texto para captar la atención. Incluye Llamada a la Acción (Suscríbete, Comenta).
-            3. Enlaces Obligatorios (Al final de la descripción):
-            🔗 SUSCRÍBETE AL CANAL: https://www.youtube.com/@Faithin10Minutes
-            4. Capítulos: Genera una lista de ${chaptersStr} títulos de capítulos inspiradores. **SOLO LOS TÍTULOS. NO INCLUYAS TIEMPOS (ej: 00:00).**
-            5. Hashtags: 3 hashtags de alto volumen en la descripción.
-            6. Tags: Lista de 20 etiquetas SEO (Fe en 10 minutos, Oración Poderosa, etc.).
-            
-            Retorna SOLO un JSON con: title, description, hashtags (array), timestamps (string multilínea - SOLO TÍTULOS), tags (array).
-        `
-    };
-    
-    const prompt = prompts[language] || prompts['en'];
-
-    const response = await ai.models.generateContent({
-        model,
-        contents: prompt,
-        config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-                 type: Type.OBJECT,
-                 properties: {
-                     title: { type: Type.STRING },
-                     description: { type: Type.STRING },
-                     hashtags: { type: Type.ARRAY, items: { type: Type.STRING } },
-                     timestamps: { type: Type.STRING },
-                     tags: { type: Type.ARRAY, items: { type: Type.STRING } }
-                 },
-                 required: ["title", "description", "hashtags", "timestamps", "tags"]
-             }
-        }
-    });
-    return JSON.parse(response.text || "{}");
-};
-
-export const getTrendingTopic = async (language: string, type: 'long' | 'short'): Promise<{ theme: string; subthemes: string[] }> => {
+export const createMediaPromptFromPrayer = async (prayer: string, language: string): Promise<string> => {
+    // This is for the 'Video Background' or 'Art', not the Thumbnail. 
+    // It should be more artistic and less 'clickbaity'.
     const model = 'gemini-2.5-flash';
     const prompt = `
-        Identify a trending or timeless spiritual topic suitable for a ${type === 'long' ? 'YouTube video' : 'TikTok/Reels'} today. 
-        Language: ${language}.
-        Target Audience: People seeking peace, faith, or strength.
-        
-        Return JSON:
-        - theme (string)
-        - subthemes (array of 3 strings)
+    Create a prompt for an AI image generator to create a cinematic, spiritual background image 
+    that matches the themes of this prayer: "${prayer.substring(0, 500)}...".
+    Style: Ethereal, hyper-realistic, 8k, cinematic lighting, peaceful, divine atmosphere.
+    No text in the image.
+    Return ONLY the prompt in English.
+    `;
+    const response = await ai.models.generateContent({ model, contents: prompt });
+    return response.text || "Ethereal spiritual background, cinematic lighting, 8k";
+};
+
+export const generateImageFromPrayer = async (prompt: string, aspectRatio: AspectRatio, model: string = 'imagen-3.0-generate-001'): Promise<string> => {
+    const response = await ai.models.generateImages({
+        model,
+        prompt,
+        config: {
+            numberOfImages: 1,
+            aspectRatio: aspectRatio,
+            outputMimeType: 'image/png',
+        },
+    });
+    return response.generatedImages[0].image.imageBytes;
+};
+
+export const generateVideo = async (prompt: string, aspectRatio: AspectRatio): Promise<string> => {
+    // Video generation is expensive/slow, ensure we use the correct model
+    const model = 'veo-3.1-fast-generate-preview'; 
+    let operation = await ai.models.generateVideos({
+        model,
+        prompt,
+        config: {
+            numberOfVideos: 1,
+            resolution: '720p',
+            aspectRatio: aspectRatio
+        }
+    });
+    
+    // Poll for completion
+    while (!operation.done) {
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        operation = await ai.operations.getVideosOperation({ operation: operation });
+    }
+    
+    return operation.response?.generatedVideos?.[0]?.video?.uri || "";
+};
+
+// --- MARKETING ASSETS GENERATION ---
+
+export const generateSocialMediaPost = async (prayer: string, language: string): Promise<SocialMediaPost> => {
+    const model = 'gemini-2.5-flash';
+    const prompt = `
+    You are a Social Media Manager for a spiritual channel.
+    Create a viral Instagram/TikTok caption for this prayer: "${prayer.substring(0, 500)}..."
+    Language: ${language}
+    
+    Output format JSON:
+    {
+        "title": "Catchy Hook (Max 50 chars)",
+        "description": "Engaging caption with emojis (Max 300 chars)",
+        "hashtags": ["tag1", "tag2", "tag3", "tag4", "tag5"]
+    }
     `;
     
     const response = await ai.models.generateContent({
         model,
         contents: prompt,
-        config: {
+        config: { responseMimeType: "application/json" }
+    });
+    
+    return JSON.parse(response.text || "{}");
+};
+
+export const generateYouTubeLongPost = async (theme: string, subthemes: string[], language: string, duration: number): Promise<YouTubeLongPost> => {
+    const model = 'gemini-2.5-flash';
+    const isPT = language === 'pt';
+    
+    // Define Static Blocks based on Language (Strict Identity)
+    const linksBlock = isPT ? `
+🌌 PARTICIPE DESTA JORNADA:
+
+► SÉRIE: Portais da Consciência (Playlist): [https://www.youtube.com/watch?v=Q6x_C3uaKsQ&list=PLmeEfeSNeLbIyeBMB8HLrHwybI__suhgq]
+
+► SÉRIE: ARQUITETURA DA ALMA (Playlist): https://www.youtube.com/playlist?list=PLmeEfeSNeLbIIm3MzGHSRFYfIONlBDofI
+
+► Oração da Manhã (Playlist): https://www.youtube.com/playlist?list=PLmeEfeSNeLbKppEyZUaBoXw4BVxZTq-I2
+
+► Oração da Noite (Playlist): https://www.youtube.com/playlist?list=PLmeEfeSNeLbLFUayT8Sfb9IQzr0ddkrHC
+
+🔗 INSCREVA-SE NO CANAL: https://www.youtube.com/@fe10minutos
+    ` : `
+🕊️ WATCH NEXT:
+
+► Architecture of the Soul (Playlist) https://www.youtube.com/playlist?list=PLTQIQ5QpCYPo11ap1JUSiItZtoiV_4lEH
+
+► Morning Prayers (Playlist): https://www.youtube.com/playlist?list=PLTQIQ5QpCYPqym_6TF19PB71SpLpAGuZr
+
+► Evening Prayers (Playlist): https://www.youtube.com/playlist?list=PLTQIQ5QpCYPq91fvXaDSideb8wrnG-YtR
+
+🔗 SUBSCRIBE TO THE CHANNEL: https://www.youtube.com/@Faithin10Minutes
+    `;
+
+    const systemInstruction = `
+    You are the SEO Expert for the channel '${isPT ? 'Fé em 10 Minutos' : 'Faith in 10 Minutes'}'.
+    Task: Create metadata for a ${duration}-minute guided prayer video about "${theme}".
+    
+    CRITICAL OUTPUT RULES:
+    1. **Title**: Must be CLICKBAIT/High-Urgency. Use CAPS and Emojis. Model: "POWERFUL ${duration} MIN PRAYER for [TOPIC] | ${isPT ? 'Fé em 10 Minutos' : 'Faith in 10 Minutes'}".
+    2. **Description**: 
+       - Paragraph 1: AIDA Copywriting hook (3 sentences). Start by repeating the exact Title.
+       - Paragraph 2: Describe the prayer using keywords: "powerful prayer", "guided prayer", "relationship with God".
+       - **MANDATORY**: Insert the LINKS BLOCK exactly as provided below (Do not translate URLs or change format).
+       - End with 3 strong hashtags: #Prayer #Faith #[TOPIC_No_Space]
+    3. **Tags**: Generate 20 high-volume tags mixed with long-tail keywords (e.g., Faith in 10 Minutes, ${duration} Minute Prayer, Powerful Prayer, [TOPIC], Daily Prayer).
+    4. **Timestamps**: Generate a list of chapters based on the subthemes. **DO NOT INCLUDE TIME CODES (00:00)**. Just the list of topics (e.g., "Introduction", "Prayer for [Subtheme 1]").
+    
+    MANDATORY LINKS BLOCK TO INSERT IN DESCRIPTION:
+    ${linksBlock}
+    `;
+
+    const prompt = `
+    Generate JSON for this video:
+    Theme: ${theme}
+    Subthemes: ${subthemes.join(', ')}
+    
+    Output Schema:
+    {
+        "title": "string",
+        "description": "string (including the links block)",
+        "hashtags": ["#string", "#string", "#string"],
+        "timestamps": "string (multiline list of topics, NO TIME CODES)",
+        "tags": ["string", "string", ...]
+    }
+    `;
+
+    const response = await ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: { 
             responseMimeType: "application/json",
-            responseSchema: {
-                 type: Type.OBJECT,
-                 properties: {
-                     theme: { type: Type.STRING },
-                     subthemes: { type: Type.ARRAY, items: { type: Type.STRING } }
-                 },
-                 required: ["theme", "subthemes"]
-             }
+            systemInstruction
         }
     });
+
     return JSON.parse(response.text || "{}");
+};
+
+// --- ANALYSIS FUNCTIONS ---
+
+export const analyzeImage = async (imageFile: File, prompt: string, language: string): Promise<string> => {
+    const model = "gemini-2.5-flash"; 
+    
+    const base64Image = await new Promise<string>((resolve) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result as string);
+        reader.readAsDataURL(imageFile);
+    });
+    const data = base64Image.split(',')[1];
+
+    const userPrompt = prompt || (language === 'pt' ? "Analise esta imagem espiritualmente." : "Analyze this image spiritually.");
+
+    const response = await ai.models.generateContent({
+        model,
+        contents: {
+            parts: [
+                { inlineData: { mimeType: imageFile.type, data } },
+                { text: userPrompt }
+            ]
+        }
+    });
+
+    return response.text || "";
+};
+
+export const getTrendingTopic = async (language: string, type: 'long' | 'short'): Promise<{theme: string, subthemes: string[]}> => {
+    // Simulated Trending Topics for the Agent
+    const themes = language === 'pt' 
+        ? ['Cura da Ansiedade', 'Prosperidade Financeira', 'Dormir em Paz', 'Proteção da Família', 'Gratidão Matinal']
+        : ['Healing Anxiety', 'Financial Prosperity', 'Sleep in Peace', 'Family Protection', 'Morning Gratitude'];
+    
+    const randomTheme = themes[Math.floor(Math.random() * themes.length)];
+    
+    return {
+        theme: randomTheme,
+        subthemes: ['Introduction', 'Deep Dive', 'Closing']
+    };
 };
